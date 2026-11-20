@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export LC_ALL=C
+
+available=/etc/nginx/sites-available
+enabled=/etc/nginx/sites-enabled
+webroot=/var/lib/nginx-reverse-proxy/acme
+site_prefix=reverse-proxy-
+
+usage() {
+    cat <<'HELP'
+Usage:
+  nginx-reverse-proxy add [DOMAIN] [OPTIONS]
+  nginx-reverse-proxy add --file FILE [OPTIONS]
+  nginx-reverse-proxy list
+  nginx-reverse-proxy remove DOMAIN [--yes]
+
+Add options:
+  --origin URL      Origin, for example http://192.0.2.20:8080
+  --email EMAIL     Email for the Let's Encrypt account
+  --www             Include www.DOMAIN in the site and certificate
+  --tls-name NAME   Certificate name and SNI for an HTTPS origin
+  --yes             Do not prompt. Supply all required values.
+
+Optional defaults: /etc/nginx-reverse-proxy/defaults
+HELP
+}
+
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+valid_host() {
+    local name=$1 label
+    local -a labels
+    [[ ${#name} -le 253 && $name =~ ^[a-zA-Z0-9.-]+$ && $name != .* && $name != *. && $name != *..* ]] || return 1
+    IFS=. read -r -a labels <<<"$name"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && $label =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
+
+valid_domain() {
+    [[ $1 == *.* && ${1##*.} =~ [a-zA-Z] ]] && valid_host "$1"
+}
+
+confirm() {
+    local reply
+    (( yes )) && return 0
+    read -rp "$1 [y/N] " reply || fail 'No answer. Use --yes for unattended operation.'
+    [[ $reply == y || $reply == Y ]] || exit 0
+}
+
+read_setting() {
+    local setting value
+    [[ -r /etc/nginx-reverse-proxy/defaults ]] || return 0
+    while IFS='=' read -r setting value || [[ -n $setting ]]; do
+        if [[ $setting == "$1" ]]; then
+            printf '%s' "$value"
+            return
+        fi
+    done </etc/nginx-reverse-proxy/defaults
+}
+
+check_nginx() {
+    local output result=0
+    output=$(nginx -t 2>&1) || result=$?
+    printf '%s\n' "$output" >&2
+    (( result == 0 )) && [[ $output != *'conflicting server name'* ]]
+}
+
+reload_nginx() {
+    check_nginx && systemctl reload nginx
+}
+
+check_origin() {
+    local authority host port host_pattern
+    host_pattern='([a-zA-Z0-9.-]+|\[[a-fA-F0-9:.]+\])'
+    [[ $origin =~ ^(https?)://$host_pattern(:([0-9]{1,5}))?$ ]] ||
+        fail 'Use an origin URL like http://192.0.2.20:8080 or https://origin.example.com. Omit paths and credentials.'
+    scheme=${BASH_REMATCH[1]}
+    authority=${origin#*://}
+    host=${BASH_REMATCH[2]}
+    port=${BASH_REMATCH[4]}
+    if [[ -n $port ]]; then
+        (( 10#$port > 0 && 10#$port <= 65535 )) || fail 'The origin port must be between 1 and 65535.'
+        origin="$scheme://$host:$((10#$port))"
+    fi
+    if [[ $host == \[*\] ]]; then
+        getent hosts "${host:1:-1}" >/dev/null || fail "Invalid or unavailable IPv6 origin: $authority"
+    else
+        valid_host "$host" || fail "Invalid origin host: $host"
+        getent ahosts "$host" >/dev/null || fail "Cannot resolve origin host: $host"
+    fi
+    if [[ $scheme == https ]]; then
+        if [[ -z $tls_name ]]; then
+            [[ $host != \[*\] && ! $host =~ ^[0-9.]+$ ]] ||
+                fail 'For an HTTPS origin at an IP address, pass its certificate hostname with --tls-name.'
+            tls_name=$host
+        fi
+        valid_host "$tls_name" || fail "Invalid TLS name: $tls_name"
+    else
+        [[ -z $tls_name ]] || fail '--tls-name requires an HTTPS origin.'
+    fi
+}
+
+check_dns() {
+    local name=$1 probe=$2 address ip records response attempt
+    local -a addresses
+    records=$(dig +time=3 +tries=2 +noall +answer "$name." A "$name." AAAA) ||
+        fail "DNS lookup failed for $name."
+    mapfile -t addresses < <(awk '$4 == "A" || $4 == "AAAA" { print $5 }' <<<"$records" | sort -u)
+    (( ${#addresses[@]} )) || fail "No A or AAAA records for $name."
+    for address in "${addresses[@]}"; do
+        ip=$address
+        [[ $address != *:* ]] || ip="[$address]"
+        # The old workers can still answer while Nginx loads the new site.
+        for attempt in 1 2 3 4; do
+            response=$(curl --silent --fail --noproxy '*' --connect-timeout 3 --max-time 4 \
+                --resolve "$name:80:$ip" "http://$name/.well-known/acme-challenge/$probe") || response=
+            [[ $response != "$probe" ]] || break
+            [[ $attempt == 4 ]] || sleep 1
+        done
+        [[ $response == "$probe" ]] ||
+            fail "$name ($address) did not reach this proxy on port 80. Check DNS, IPv6 and the firewall."
+    done
+}
+
+http_site() {
+    local names=$1 tail=$2
+    cat <<NGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $names;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root $webroot;
+        try_files \$uri =404;
+    }
+
+$tail
+}
+NGINX
+}
+
+https_site() {
+    local domain=$1 names=$2 pattern=$3
+    http_site "$names" "    if (\$host !~ ^($pattern)\$) { return 421; }
+    location / { return 301 https://\$host\$request_uri; }"
+    cat <<NGINX
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    server_name $names;
+
+    ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    if (\$host !~ ^($pattern)\$) { return 421; }
+
+    location / {
+        proxy_pass $origin;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Forwarded "";
+NGINX
+    if [[ $scheme == https ]]; then
+        cat <<NGINX
+        proxy_ssl_server_name on;
+        proxy_ssl_protocols TLSv1.2 TLSv1.3;
+        proxy_ssl_name $tls_name;
+        proxy_ssl_verify on;
+        proxy_ssl_verify_depth 3;
+        proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+NGINX
+    fi
+    printf '    }\n}\n'
+}
+
+config_path() { printf '%s/%s%s.conf' "$available" "$site_prefix" "$1"; }
+link_path() { printf '%s/%s%s.conf' "$enabled" "$site_prefix" "$1"; }
+
+pending_config=
+pending_link=
+staged=
+removed_link=
+removed_config=
+cleanup() {
+    local status=$?
+    trap - EXIT
+    if [[ -n $staged ]]; then
+        rm -f -- "$staged" || status=1
+    fi
+    if [[ -n $pending_config ]]; then
+        printf 'Rolling back the Nginx configuration.\n' >&2
+        if [[ -n $pending_link ]]; then
+            rm -f -- "$pending_link" || status=1
+        fi
+        rm -f -- "$pending_config" || status=1
+        reload_nginx || printf 'Could not reload Nginx after rollback. Run nginx -t.\n' >&2
+        status=1
+    fi
+    if [[ -n $removed_link ]]; then
+        ln -sT -- "$removed_config" "$removed_link" &&
+            reload_nginx || printf 'Could not restore the enabled site. Run nginx -t.\n' >&2
+        status=1
+    fi
+    exit "$status"
+}
+
+add_site() {
+    local domain=$1 name config link names probe pattern
+    local -a names_list=("$domain") cert_args=()
+    (( ! www )) || names_list+=("www.$domain")
+    config=$(config_path "$domain")
+    link=$(link_path "$domain")
+    names=${names_list[*]}
+    pattern=${names//./\\.}
+    pattern=${pattern// /|}
+    for name in "${names_list[@]}"; do cert_args+=(-d "$name"); done
+
+    printf '\nAdding %s → %s\n' "$names" "$origin"
+    probe=nrp-$(cat /proc/sys/kernel/random/uuid)
+    staged=$(mktemp "$available/.reverse-proxy-XXXXXX")
+    http_site "$names" "    location = /.well-known/acme-challenge/$probe { return 200 \"$probe\"; }
+    location / { return 404; }" >"$staged"
+    # The enabled symlink always points to a complete file.
+    ln -T -- "$staged" "$config"
+    pending_config=$config
+    rm -- "$staged"
+    staged=
+    ln -sT -- "$config" "$link"
+    pending_link=$link
+    reload_nginx || fail "Could not load the temporary site for $domain."
+
+    printf 'Checking public DNS and HTTP for %s\n' "$names"
+    for name in "${names_list[@]}"; do check_dns "$name" "$probe"; done
+    certbot certonly --webroot -w "$webroot" --non-interactive --agree-tos \
+        --email "$email" --cert-name "$domain" --keep-until-expiring "${cert_args[@]}"
+
+    staged=$(mktemp "$available/.reverse-proxy-XXXXXX")
+    https_site "$domain" "$names" "$pattern" >"$staged"
+    mv -Tf -- "$staged" "$config"
+    staged=
+    reload_nginx || fail "Could not load HTTPS for $domain."
+    pending_config=
+    pending_link=
+    printf 'Ready: https://%s\n' "$domain"
+}
+
+read_domain_file() {
+    local line
+    [[ -f $file && -r $file ]] || fail "Cannot read $file."
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%#*}
+        line=${line#"${line%%[![:space:]]*}"}
+        line=${line%"${line##*[![:space:]]}"}
+        [[ -z $line ]] || domains+=("${line,,}")
+    done <"$file"
+    (( ${#domains[@]} )) || fail "No domains in $file."
+}
+
+add() {
+    local domain='' file='' origin='' email='' tls_name='' www=0 yes=0 path name
+    local -a domains=()
+    local -A seen=() occupied=()
+    while (( $# )); do
+        case $1 in
+            --file|--origin|--email|--tls-name)
+                [[ ${2:-} && $2 != --* ]] || fail "$1 needs a value."
+                case $1 in
+                    --file) file=$2 ;;
+                    --origin) origin=$2 ;;
+                    --email) email=$2 ;;
+                    --tls-name) tls_name=$2 ;;
+                esac
+                shift ;;
+            --www) www=1 ;;
+            --yes) yes=1 ;;
+            -*) fail "Unknown option: $1" ;;
+            *) [[ -z $domain ]] || fail 'Pass one domain or use --file.'
+               domain=${1,,} ;;
+        esac
+        shift
+    done
+    if [[ -n $file ]]; then
+        [[ -z $domain ]] || fail 'Pass one domain or use --file.'
+        read_domain_file
+    else
+        if [[ -z $domain && $yes == 0 ]]; then
+            read -rp 'Public domain: ' domain || fail 'Enter a public domain.'
+        fi
+        domains=("${domain,,}")
+    fi
+
+    for domain in "${domains[@]}"; do
+        valid_domain "$domain" || fail "Invalid public domain: $domain"
+        (( ${#site_prefix} + ${#domain} + 5 <= 255 )) || fail "Domain is too long for a site filename: $domain"
+        if (( www )); then
+            valid_domain "www.$domain" || fail "Invalid alias: www.$domain"
+        fi
+    done
+    [[ -n $origin ]] || origin=$(read_setting origin)
+    [[ -n $email ]] || email=$(read_setting email)
+    if (( ! yes )); then
+        [[ -n $origin ]] || read -rp 'Origin URL (http:// or https://): ' origin || fail 'Enter an origin URL.'
+        [[ -n $email ]] || read -rp "Email for Let's Encrypt: " email || fail 'Enter an email address.'
+    fi
+    check_origin
+    [[ $email =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]] ||
+        fail 'Pass a valid email with --email or set it in defaults.'
+
+    shopt -s nullglob
+    for path in "$available"/reverse-proxy-*.conf; do
+        # A retained config reserves its names so it can be re-enabled later.
+        while read -r name; do occupied[$name]=1; done < <(
+            awk '$1 == "server_name" { sub(/;$/, "", $NF); for (i=2; i<=NF; i++) print $i }' "$path" | sort -u
+        )
+    done
+    for domain in "${domains[@]}"; do
+        local -a names=("$domain")
+        (( ! www )) || names+=("www.$domain")
+        for name in "${names[@]}"; do
+            [[ ! ${seen[$name]+set} && ! ${occupied[$name]+set} ]] ||
+                fail "$name already belongs to a site or appears twice in this request."
+            seen[$name]=1
+        done
+        path=$(config_path "$domain")
+        [[ ! -e $path && ! -L $path ]] || fail "Config already exists for $domain."
+        path=$(link_path "$domain")
+        [[ ! -e $path && ! -L $path ]] || fail "Enabled path already exists for $domain."
+    done
+
+    printf 'Origin: %s\nDomains: %s\n' "$origin" "${domains[*]}"
+    (( ! www )) || printf 'Includes www for each domain.\n'
+    confirm 'Create these sites and request certificates?'
+    check_nginx || fail 'Resolve the Nginx configuration errors before adding sites.'
+    for domain in "${domains[@]}"; do add_site "$domain"; done
+}
+
+list() {
+    local path domain status found=0
+    shopt -s nullglob
+    for path in "$available"/reverse-proxy-*.conf; do
+        domain=${path##*/reverse-proxy-}
+        domain=${domain%.conf}
+        status=disabled
+        [[ ! -L $(link_path "$domain") ]] || status=enabled
+        printf '%s\t%s\n' "$domain" "$status"
+        found=1
+    done
+    (( found )) || printf 'No managed sites.\n'
+}
+
+remove() {
+    local domain=${1:-} link config yes=0
+    domain=${domain,,}
+    valid_domain "$domain" || fail 'Usage: nginx-reverse-proxy remove DOMAIN [--yes]'
+    [[ $# -le 2 && ( $# == 1 || $2 == --yes ) ]] || fail 'Unexpected remove option.'
+    [[ $# == 1 ]] || yes=1
+    config=$(config_path "$domain")
+    link=$(link_path "$domain")
+    [[ -f $config && -L $link && $(readlink -- "$link") == "$config" ]] ||
+        fail "No enabled managed site for $domain."
+    confirm "Disable $domain?"
+    check_nginx || fail 'Resolve the Nginx configuration errors before disabling a site.'
+    rm -- "$link"
+    removed_config=$config
+    removed_link=$link
+    reload_nginx || fail "Could not disable $domain."
+    removed_link=
+    printf 'Disabled %s. Config and certificate kept.\n' "$domain"
+}
+
+case ${1:-} in
+    ''|-h|--help) usage; exit 0 ;;
+    add|list|remove) action=$1; shift ;;
+    *) fail "Unknown command: $1. See --help." ;;
+esac
+[[ $EUID == 0 ]] || fail 'Run with sudo.'
+[[ -d $webroot ]] || fail 'Run install.sh first.'
+exec 9>/run/nginx-reverse-proxy.lock
+flock 9
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+case $action in
+    add) add "$@" ;;
+    list) [[ $# == 0 ]] || fail 'Usage: nginx-reverse-proxy list'; list ;;
+    remove) remove "$@" ;;
+esac
